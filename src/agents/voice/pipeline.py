@@ -5,7 +5,11 @@ from typing import Any
 
 from .._config_coercion import coerce_dataclass_config
 from ..exceptions import UserError
-from ..logger import logger
+from ..logger import (
+    log_model_and_tool_action_error,
+    log_model_and_tool_action_warning,
+    logger,
+)
 from ..tracing import TraceCtxManager
 from .input import AudioInput, StreamedAudioInput
 from .model import STTModel, TTSModel
@@ -109,7 +113,7 @@ class VoicePipeline:
                     await output._turn_done()
                     await output._done()
                 except Exception as e:
-                    logger.error("Error processing single turn: %s", e)
+                    log_model_and_tool_action_error(logger, "Error processing single voice turn", e)
                     await output._add_error(e)
                     raise e
 
@@ -135,7 +139,9 @@ class VoicePipeline:
                         async for intro_text in self.workflow.on_start():
                             await output._add_text(intro_text)
                     except Exception as e:
-                        logger.warning("on_start() failed: %s", e)
+                        log_model_and_tool_action_warning(
+                            logger, "Voice workflow on_start failed", e
+                        )
 
                     transcription_session = await self._get_stt_model().create_session(
                         audio_input,
@@ -150,7 +156,7 @@ class VoicePipeline:
                             await output._add_text(text_event)
                         await output._turn_done()
                 except Exception as e:
-                    logger.error("Error processing turns: %s", e)
+                    log_model_and_tool_action_error(logger, "Error processing voice turns", e)
                     await output._add_error(e)
                     raise e
                 finally:

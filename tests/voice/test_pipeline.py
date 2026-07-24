@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -8,6 +9,7 @@ import numpy as np
 import numpy.typing as npt
 import pytest
 
+import agents._debug as _debug
 from agents import trace
 from tests.testing_processor import fetch_events, fetch_span_errors
 
@@ -437,10 +439,24 @@ class _BlockingWorkflow(FakeWorkflow):
         yield "out_1"
 
 
+class _FailingWorkflow(FakeWorkflow):
+    def __init__(self, error: BaseException):
+        super().__init__()
+        self.error = error
+
+    async def run(self, _: str):
+        raise self.error
+        yield ""  # pragma: no cover
+
+
 class _OnStartYieldThenFailWorkflow(FakeWorkflow):
+    def __init__(self, outputs: list[list[str]], error: BaseException | None = None):
+        super().__init__(outputs)
+        self.error = error or RuntimeError("boom")
+
     async def on_start(self):
         yield "intro"
-        raise RuntimeError("boom")
+        raise self.error
 
 
 @pytest.mark.asyncio
@@ -493,3 +509,140 @@ async def test_voicepipeline_multi_turn_on_start_exception_does_not_abort() -> N
 
     assert events[-1] == "session_ended"
     assert "error" not in events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model_redacted", "tool_redacted", "redacted"),
+    [
+        (True, False, True),
+        (False, True, True),
+        (False, False, False),
+    ],
+)
+async def test_voice_on_start_errors_apply_model_and_tool_logging_policies(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    model_redacted: bool,
+    tool_redacted: bool,
+    redacted: bool,
+) -> None:
+    monkeypatch.setattr(_debug, "DONT_LOG_MODEL_DATA", model_redacted)
+    monkeypatch.setattr(_debug, "DONT_LOG_TOOL_DATA", tool_redacted)
+    cause = ValueError("SECRET_VOICE_ON_START_TOOL_PAYLOAD")
+    error = RuntimeError("Voice startup failed")
+    error.__cause__ = cause
+    pipeline = VoicePipeline(
+        workflow=_OnStartYieldThenFailWorkflow([["out_1"]], error),
+        stt_model=FakeSTT(["first"]),
+        tts_model=FakeTTS(),
+    )
+    streamed_audio_input = await FakeStreamedAudioInput.get(count=1)
+    caplog.set_level(logging.WARNING, logger="openai.agents")
+
+    result = await pipeline.run(streamed_audio_input)
+    events, _ = await extract_events(result)
+
+    assert events[-1] == "session_ended"
+    records = [
+        record
+        for record in caplog.records
+        if record.name == "openai.agents"
+        and (
+            record.msg
+            in {
+                "Voice workflow on_start failed",
+                "Voice workflow on_start failed: %s",
+            }
+            or (
+                isinstance(record.args, tuple)
+                and record.args
+                and record.args[0] == "Voice workflow on_start failed"
+            )
+        )
+    ]
+    assert len(records) == 1
+    record = records[0]
+    if redacted:
+        assert record.msg == "%s"
+        assert record.args == ("Voice workflow on_start failed",)
+        assert record.exc_info is None
+        assert record.exc_text is None
+        assert error not in record.__dict__.values()
+        assert cause not in record.__dict__.values()
+        assert "SECRET_VOICE_ON_START_TOOL_PAYLOAD" not in logging.Formatter().format(record)
+    else:
+        assert record.msg == "%s: %s"
+        assert isinstance(record.args, tuple)
+        assert error in record.args
+        assert record.exc_info is not None
+        assert record.exc_info[1] is error
+        assert "SECRET_VOICE_ON_START_TOOL_PAYLOAD" in logging.Formatter().format(record)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streamed", [False, True])
+@pytest.mark.parametrize(
+    ("model_redacted", "tool_redacted", "redacted"),
+    [
+        (True, False, True),
+        (False, True, True),
+        (False, False, False),
+    ],
+)
+async def test_voice_workflow_errors_apply_model_and_tool_logging_policies(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    streamed: bool,
+    model_redacted: bool,
+    tool_redacted: bool,
+    redacted: bool,
+) -> None:
+    monkeypatch.setattr(_debug, "DONT_LOG_MODEL_DATA", model_redacted)
+    monkeypatch.setattr(_debug, "DONT_LOG_TOOL_DATA", tool_redacted)
+    error = RuntimeError("SECRET_VOICE_TOOL_PAYLOAD")
+    pipeline = VoicePipeline(
+        workflow=_FailingWorkflow(error),
+        stt_model=FakeSTT(["first"]),
+        tts_model=FakeTTS(),
+    )
+    audio_input = (
+        await FakeStreamedAudioInput.get(count=1)
+        if streamed
+        else AudioInput(buffer=np.zeros(2, dtype=np.int16))
+    )
+    caplog.set_level(logging.ERROR, logger="openai.agents")
+
+    result = await pipeline.run(audio_input)
+    with pytest.raises(RuntimeError, match="SECRET_VOICE_TOOL_PAYLOAD"):
+        await extract_events(result)
+    assert result.text_generation_task is not None
+    assert result.text_generation_task.exception() is error
+
+    expected_pipeline_message = (
+        "Error processing voice turns" if streamed else "Error processing single voice turn"
+    )
+    records = [
+        record
+        for record in caplog.records
+        if record.name == "openai.agents"
+        and isinstance(record.args, tuple)
+        and record.args
+        and record.args[0] in {expected_pipeline_message, "Error processing voice output"}
+    ]
+    assert len(records) == 2
+    for record in records:
+        if redacted:
+            assert record.msg == "%s"
+            assert record.args in {
+                (expected_pipeline_message,),
+                ("Error processing voice output",),
+            }
+            assert record.exc_info is None
+            assert "SECRET_VOICE_TOOL_PAYLOAD" not in logging.Formatter().format(record)
+        else:
+            assert record.msg == "%s: %s"
+            assert isinstance(record.args, tuple)
+            assert error in record.args
+            assert record.exc_info is not None
+            assert record.exc_info[1] is error
